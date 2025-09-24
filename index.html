@@ -1,0 +1,576 @@
+Trial html code:
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>The Living Labyrinth</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            background-color: #111;
+            color: #eee;
+            font-family: 'Courier New', Courier, monospace;
+            overflow: hidden;
+        }
+        canvas {
+            background-color: #000;
+            border: 2px solid #444;
+            box-shadow: 0 0 20px rgba(255, 255, 255, 0.1);
+        }
+        #ui-container {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            padding: 15px;
+            background-color: rgba(0,0,0,0.5);
+            border-radius: 8px;
+            border: 1px solid #444;
+        }
+        #ui-container h1 {
+            margin: 0 0 10px 0;
+            font-size: 1.5em;
+        }
+        #ui-container p {
+            margin: 5px 0;
+        }
+        #fade-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: #000;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.5s ease-in-out;
+        }
+    </style>
+</head>
+<body>
+    <div id="ui-container">
+        <h1>The Living Labyrinth</h1>
+        <p>Use WASD or Arrow Keys to move.</p>
+        <p>Press 'F' to toggle torch.</p>
+        <p>Press 'Space' to wiggle out.</p>
+        <p>Hold 'Shift' to run.</p>
+    </div>
+    <canvas id="gameCanvas"></canvas>
+    <div id="fade-overlay"></div>
+
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        const fadeOverlay = document.getElementById('fade-overlay');
+
+        // --- Game Configuration ---
+        const TILE_SIZE = 40;
+        const MAZE_WIDTH = 25;
+        const MAZE_HEIGHT = 19;
+        const SHOUT_CHARGE_TIME = 180; // 3 seconds at 60fps
+        const TAP_THRESHOLD = 15; // Frames to count as a 'tap'
+        const DOOR_TOGGLE_INTERVAL = 120; // Doors open/close every 2 seconds
+        const BAT_COUNT = 15;
+        const BAT_FLEE_RADIUS = 120;
+        const BAT_SPEED = 2.0;
+        const BAT_WANDER_SPEED = 1.0;
+
+        // --- Game State ---
+        let maze = [];
+        let player = {
+            x: (Math.floor(MAZE_WIDTH / 2) + 0.5) * TILE_SIZE,
+            y: (Math.floor(MAZE_HEIGHT / 2) + 0.5) * TILE_SIZE,
+            speed: 1.5,
+            noise: 0,
+            sanity: 1.0,
+            torchOn: true,
+            lightRadius: 250,
+            directionX: 0,
+            directionY: -1,
+            shoutCharge: 0,
+        };
+        let bats = [];
+        const keys = {};
+        let doorToggleTimer = DOOR_TOGGLE_INTERVAL;
+        let screenShake = { intensity: 0, duration: 0 };
+        let isTransitioning = false;
+
+        // --- Asset Types ---
+        const TILE_TYPE = {
+            FLOOR: 0,
+            WALL: 1,
+            VINE: 2, 
+            TRAP_DORMANT: 3,
+            TRAP_ACTIVE: 4,
+            SEALED_WALL: 5,
+            END_POINT: 6,
+            DOOR_CLOSED: 7,
+            DOOR_OPEN: 8,
+        };
+        
+        const TILE_COLORS = {
+            [TILE_TYPE.FLOOR]: "#ddd",
+            [TILE_TYPE.WALL]: "#555",
+            [TILE_TYPE.VINE]: "#888",
+            [TILE_TYPE.TRAP_DORMANT]: "#ccc",
+            [TILE_TYPE.TRAP_ACTIVE]: "#111",
+            [TILE_TYPE.SEALED_WALL]: "#333",
+            [TILE_TYPE.END_POINT]: "#ddd",
+            [TILE_TYPE.DOOR_CLOSED]: "#444",
+            [TILE_TYPE.DOOR_OPEN]: "#a0a0a0",
+        };
+
+        function generateMaze(width, height) {
+            let newMaze = Array.from({ length: height }, () => Array(width).fill(TILE_TYPE.WALL));
+            const startX = Math.floor(width / 2);
+            const startY = Math.floor(height / 2);
+
+            function carve(cx, cy) {
+                const directions = [[0, -2], [0, 2], [-2, 0], [2, 0]];
+                directions.sort(() => Math.random() - 0.5);
+
+                for (let [dx, dy] of directions) {
+                    const nx = cx + dx;
+                    const ny = cy + dy;
+                    if (ny > 0 && ny < height -1 && nx > 0 && nx < width -1 && newMaze[ny][nx] === TILE_TYPE.WALL) {
+                        newMaze[cy + dy / 2][cx + dx / 2] = TILE_TYPE.FLOOR;
+                        newMaze[ny][nx] = TILE_TYPE.FLOOR;
+                        carve(nx, ny);
+                    }
+                }
+            }
+
+            newMaze[startY][startX] = TILE_TYPE.FLOOR;
+            carve(startX, startY);
+            
+            const wallsToRemove = Math.floor(width * height * 0.08);
+            for (let i = 0; i < wallsToRemove; i++) {
+                const rx = Math.floor(Math.random() * (width - 2)) + 1;
+                const ry = Math.floor(Math.random() * (height - 2)) + 1;
+                if (newMaze[ry][rx] === TILE_TYPE.WALL) {
+                     if (rx !== startX || ry !== startY) newMaze[ry][rx] = TILE_TYPE.FLOOR;
+                }
+            }
+
+            let doorCount = 0;
+            for (let i = 0; i < (width * height) * 0.1; i++) {
+                const rx = Math.floor(Math.random() * (width - 2)) + 1;
+                const ry = Math.floor(Math.random() * (height - 2)) + 1;
+                
+                if (doorCount < 5 && newMaze[ry][rx] === TILE_TYPE.FLOOR) {
+                    const isHorizontalCorridor = newMaze[ry - 1][rx] === TILE_TYPE.WALL && newMaze[ry + 1][rx] === TILE_TYPE.WALL;
+                    const isVerticalCorridor = newMaze[ry][rx - 1] === TILE_TYPE.WALL && newMaze[ry][rx + 1] === TILE_TYPE.WALL;
+                    if (isHorizontalCorridor || isVerticalCorridor) {
+                        newMaze[ry][rx] = TILE_TYPE.DOOR_CLOSED;
+                        doorCount++;
+                    }
+                }
+
+                if (newMaze[ry][rx] === TILE_TYPE.WALL) newMaze[ry][rx] = TILE_TYPE.VINE;
+            }
+
+            newMaze[height-2][width-2] = TILE_TYPE.END_POINT;
+            return newMaze;
+        }
+
+        function spawnBats(count) {
+            bats = [];
+            for (let i = 0; i < count; i++) {
+                let placed = false;
+                while (!placed) {
+                    const x = Math.floor(Math.random() * MAZE_WIDTH);
+                    const y = Math.floor(Math.random() * MAZE_HEIGHT);
+                    if (maze[y][x] === TILE_TYPE.FLOOR) {
+                        bats.push({
+                            x: (x + 0.5) * TILE_SIZE,
+                            y: (y + 0.5) * TILE_SIZE,
+                            vx: 0,
+                            vy: 0,
+                        });
+                        placed = true;
+                    }
+                }
+            }
+        }
+
+        function nextLevel() {
+            if (isTransitioning) return;
+            isTransitioning = true;
+            fadeOverlay.style.opacity = '1';
+
+            setTimeout(() => {
+                maze = generateMaze(MAZE_WIDTH, MAZE_HEIGHT);
+                player.x = (Math.floor(MAZE_WIDTH / 2) + 0.5) * TILE_SIZE;
+                player.y = (Math.floor(MAZE_HEIGHT / 2) + 0.5) * TILE_SIZE;
+                spawnBats(BAT_COUNT);
+                
+                setTimeout(() => {
+                    fadeOverlay.style.opacity = '0';
+                    isTransitioning = false;
+                }, 100);
+
+            }, 500);
+        }
+
+        function setup() {
+            canvas.width = MAZE_WIDTH * TILE_SIZE;
+            canvas.height = MAZE_HEIGHT * TILE_SIZE;
+            maze = generateMaze(MAZE_WIDTH, MAZE_HEIGHT);
+            spawnBats(BAT_COUNT);
+
+            window.addEventListener('keydown', (e) => {
+                const key = e.key.toLowerCase();
+                keys[key] = true;
+                if (key === 'f') player.torchOn = !player.torchOn;
+                if (key === ' ') e.preventDefault();
+            });
+            
+            window.addEventListener('keyup', (e) => {
+                const key = e.key.toLowerCase();
+                if (key === ' ' && player.shoutCharge > 0 && player.shoutCharge < TAP_THRESHOLD) {
+                    triggerEchoLocation();
+                }
+                keys[key] = false;
+            });
+
+            gameLoop();
+        }
+
+        function movePlayer() {
+            if (isTransitioning) return;
+            let currentSpeed = player.speed;
+            player.noise = 0; 
+
+            if (keys['shift']) {
+                currentSpeed = 2; 
+                player.noise = 150;
+                triggerScreenShake(2, 5);
+            } else if (keys['w'] || keys['s'] || keys['a'] || keys['d'] || keys['arrowup'] || keys['arrowdown'] || keys['arrowleft'] || keys['arrowright']) {
+                 player.noise = 50;
+            }
+
+            let dx = 0;
+            let dy = 0;
+            if (keys['w'] || keys['arrowup']) dy -= 1;
+            if (keys['s'] || keys['arrowdown']) dy += 1;
+            if (keys['a'] || keys['arrowleft']) dx -= 1;
+            if (keys['d'] || keys['arrowright']) dx += 1;
+
+            if (dx !== 0 || dy !== 0) {
+                const magnitude = Math.sqrt(dx * dx + dy * dy);
+                player.directionX = dx / magnitude;
+                player.directionY = dy / magnitude;
+                dx = (dx / magnitude) * currentSpeed;
+                dy = (dy / magnitude) * currentSpeed;
+            }
+            
+            const nextX = player.x + dx;
+            const nextY = player.y + dy;
+
+            if (keys['shift']) {
+                const playerGridX = Math.floor(player.x / TILE_SIZE);
+                const playerGridY = Math.floor(player.y / TILE_SIZE);
+                if(maze[playerGridY] && maze[playerGridY][playerGridX] === TILE_TYPE.FLOOR){
+                     if (Math.random() < 0.003) {
+                        maze[playerGridY][playerGridX] = TILE_TYPE.SEALED_WALL;
+                    }
+                }
+            }
+
+            if (isWalkable(nextX, player.y)) player.x = nextX;
+            if (isWalkable(player.x, nextY)) player.y = nextY;
+            
+            const playerGridX = Math.floor(player.x / TILE_SIZE);
+            const playerGridY = Math.floor(player.y / TILE_SIZE);
+            if (maze[playerGridY] && maze[playerGridY][playerGridX] === TILE_TYPE.END_POINT) {
+                nextLevel();
+            }
+        }
+        
+        function isWalkable(x, y) {
+            const size = TILE_SIZE * 0.4;
+            const corners = [
+                {x: x - size/2, y: y - size/2}, {x: x + size/2, y: y - size/2},
+                {x: x - size/2, y: y + size/2}, {x: x + size/2, y: y + size/2},
+            ];
+
+            for (const corner of corners) {
+                const gridX = Math.floor(corner.x / TILE_SIZE);
+                const gridY = Math.floor(corner.y / TILE_SIZE);
+                if (gridX < 0 || gridX >= MAZE_WIDTH || gridY < 0 || gridY >= MAZE_HEIGHT) return false;
+                const tile = maze[gridY][gridX];
+                if (tile === TILE_TYPE.WALL || tile === TILE_TYPE.SEALED_WALL || tile === TILE_TYPE.VINE || tile === TILE_TYPE.DOOR_CLOSED) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        function breakSealedWalls() {
+            triggerScreenShake(12, 20);
+            const gridX = Math.floor(player.x / TILE_SIZE);
+            const gridY = Math.floor(player.y / TILE_SIZE);
+
+            for (let yOffset = -1; yOffset <= 1; yOffset++) {
+                for (let xOffset = -1; xOffset <= 1; xOffset++) {
+                    const checkX = gridX + xOffset;
+                    const checkY = gridY + yOffset;
+                    if (checkY >= 0 && checkY < MAZE_HEIGHT && checkX >= 0 && checkX < MAZE_WIDTH) {
+                        if (maze[checkY][checkX] === TILE_TYPE.SEALED_WALL) {
+                            maze[checkY][checkX] = TILE_TYPE.FLOOR;
+                        }
+                    }
+                }
+            }
+        }
+
+        function updateShout() {
+            if (isTransitioning || !keys[' ']) {
+                player.shoutCharge = 0;
+                return;
+            }
+            player.shoutCharge++;
+            triggerScreenShake(2, 5);
+            if (player.shoutCharge >= SHOUT_CHARGE_TIME) {
+                breakSealedWalls();
+                player.shoutCharge = 0; 
+                keys[' '] = false;
+            }
+        }
+        
+        let echo = { active: false, radius: 0, maxRadius: 400, x: 0, y: 0 };
+        function triggerEchoLocation() {
+            if (!echo.active) {
+                echo.active = true;
+                echo.radius = 0;
+                echo.x = player.x;
+                echo.y = player.y;
+                player.noise = 300;
+                triggerScreenShake(2, 5);
+            }
+        }
+
+        function updateEchoLocation() {
+            if (echo.active) {
+                echo.radius += 15;
+                if (echo.radius > echo.maxRadius) {
+                    echo.active = false;
+                }
+            }
+        }
+
+        function updateDoors() {
+            doorToggleTimer--;
+            if (doorToggleTimer <= 0) {
+                for (let y = 0; y < MAZE_HEIGHT; y++) {
+                    for (let x = 0; x < MAZE_WIDTH; x++) {
+                        if (maze[y][x] === TILE_TYPE.DOOR_CLOSED) maze[y][x] = TILE_TYPE.DOOR_OPEN;
+                        else if (maze[y][x] === TILE_TYPE.DOOR_OPEN) maze[y][x] = TILE_TYPE.DOOR_CLOSED;
+                    }
+                }
+                doorToggleTimer = DOOR_TOGGLE_INTERVAL;
+            }
+        }
+
+        function updateBats() {
+            bats.forEach(bat => {
+                const dx = player.x - bat.x;
+                const dy = player.y - bat.y;
+                const distance = Math.sqrt(dx * dx + dy * dy);
+                let isFleeing = false;
+
+                if (distance < BAT_FLEE_RADIUS && player.torchOn) {
+                    const angle = Math.atan2(dy, dx);
+                    bat.vx -= Math.cos(angle) * BAT_SPEED * 0.1;
+                    bat.vy -= Math.sin(angle) * BAT_SPEED * 0.1;
+                    isFleeing = true;
+                } else {
+                    // Wander around when not fleeing
+                    if (Math.random() < 0.1) {
+                        bat.vx += (Math.random() - 0.5) * 0.5;
+                        bat.vy += (Math.random() - 0.5) * 0.5;
+                    }
+                }
+
+                bat.vx *= 0.95; // Friction
+                bat.vy *= 0.95;
+
+                const speed = Math.sqrt(bat.vx * bat.vx + bat.vy * bat.vy);
+                const maxSpeed = isFleeing ? BAT_SPEED : BAT_WANDER_SPEED;
+
+                if (speed > maxSpeed) {
+                    bat.vx = (bat.vx / speed) * maxSpeed;
+                    bat.vy = (bat.vy / speed) * maxSpeed;
+                }
+
+                const nextX = bat.x + bat.vx;
+                const nextY = bat.y + bat.vy;
+                
+                const gridX = Math.floor(nextX / TILE_SIZE);
+                const gridY = Math.floor(nextY / TILE_SIZE);
+                if (maze[gridY] && isWalkable(nextX, nextY)) {
+                    bat.x = nextX;
+                    bat.y = nextY;
+                } else {
+                    bat.vx *= -0.5; // Bounce
+                    bat.vy *= -0.5;
+                }
+            });
+        }
+
+        function triggerScreenShake(intensity, duration) {
+            screenShake.intensity = intensity;
+            screenShake.duration = duration;
+        }
+
+        function updateScreenShake() {
+            if (screenShake.duration > 0) screenShake.duration--;
+            if (screenShake.duration <= 0) screenShake.intensity = 0;
+        }
+
+        function drawStar(cx, cy, outerRadius, points) {
+            const innerRadius = outerRadius / 2;
+            let rot = Math.PI / 2 * 3;
+            let step = Math.PI / points;
+
+            ctx.beginPath();
+            ctx.moveTo(cx, cy - outerRadius);
+            for (let i = 0; i < points; i++) {
+                ctx.lineTo(cx + Math.cos(rot) * outerRadius, cy + Math.sin(rot) * outerRadius);
+                rot += step;
+                ctx.lineTo(cx + Math.cos(rot) * innerRadius, cy + Math.sin(rot) * innerRadius);
+                rot += step;
+            }
+            ctx.lineTo(cx, cy - outerRadius);
+            ctx.closePath();
+            ctx.lineWidth = 3;
+            ctx.strokeStyle = '#000';
+            ctx.stroke();
+            ctx.fillStyle = '#000';
+            ctx.fill();
+        }
+
+        function draw() {
+            ctx.save();
+
+            if (screenShake.intensity > 0) {
+                const shakeX = (Math.random() - 0.5) * screenShake.intensity;
+                const shakeY = (Math.random() - 0.5) * screenShake.intensity;
+                ctx.translate(shakeX, shakeY);
+            }
+
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            
+            for (let y = 0; y < MAZE_HEIGHT; y++) {
+                for (let x = 0; x < MAZE_WIDTH; x++) {
+                    const tileX = x * TILE_SIZE;
+                    const tileY = y * TILE_SIZE;
+                    
+                    if (maze[y][x] === TILE_TYPE.END_POINT) {
+                        ctx.fillStyle = TILE_COLORS[TILE_TYPE.FLOOR];
+                        ctx.fillRect(tileX, tileY, TILE_SIZE, TILE_SIZE);
+                        drawStar(tileX + TILE_SIZE / 2, tileY + TILE_SIZE / 2, TILE_SIZE / 2.5, 5);
+                    } else {
+                        const dx = player.x - (tileX + TILE_SIZE / 2);
+                        const dy = player.y - (tileY + TILE_SIZE / 2);
+                        const distance = Math.sqrt(dx * dx + dy * dy);
+                        let color = TILE_COLORS[maze[y][x]];
+                        
+                        if (maze[y][x] === TILE_TYPE.VINE && distance < player.lightRadius * 0.8 && player.torchOn) color = "#9e9e9e";
+                        if (maze[y][x] === TILE_TYPE.VINE && echo.active && distance < echo.radius && distance > echo.radius - 30) color = "#fff";
+
+                        ctx.fillStyle = color;
+                        ctx.fillRect(tileX, tileY, TILE_SIZE, TILE_SIZE);
+                    }
+                }
+            }
+            
+            ctx.fillStyle = '#222';
+            bats.forEach(bat => {
+                ctx.beginPath();
+                ctx.moveTo(bat.x, bat.y - 4);
+                ctx.lineTo(bat.x - 4, bat.y + 4);
+                ctx.lineTo(bat.x + 4, bat.y + 4);
+                ctx.closePath();
+                ctx.fill();
+            });
+
+            ctx.fillStyle = '#000';
+            ctx.beginPath();
+            ctx.arc(player.x, player.y, TILE_SIZE / 3, 0, Math.PI * 2);
+            ctx.fill();
+            
+            if (player.shoutCharge > 0 && player.shoutCharge < SHOUT_CHARGE_TIME) {
+                const pulseInterval = 60;
+                const maxPulseRadius = TILE_SIZE * 1.5;
+                for (let i = 0; i < 2; i++) {
+                    const pulseProgress = ((player.shoutCharge + i * (pulseInterval / 2)) % pulseInterval) / pulseInterval;
+                    const radius = pulseProgress * maxPulseRadius;
+                    const opacity = 1 - pulseProgress;
+                    ctx.strokeStyle = `rgba(255, 255, 255, ${opacity})`;
+                    ctx.lineWidth = 2;
+                    ctx.beginPath();
+                    ctx.arc(player.x, player.y, radius, 0, Math.PI * 2);
+                    ctx.stroke();
+                }
+            }
+
+            ctx.save();
+            const flicker = 1 - ((1 - player.sanity) * 0.5 * Math.random());
+            const currentLightRadius = player.lightRadius * flicker;
+            const angle = Math.atan2(player.directionY, player.directionX);
+            const coneAngle = Math.PI / 2.5;
+            
+            ctx.beginPath();
+            if (player.torchOn) {
+                ctx.moveTo(player.x, player.y);
+                ctx.arc(player.x, player.y, currentLightRadius, angle - coneAngle / 2, angle + coneAngle / 2);
+                ctx.lineTo(player.x, player.y);
+                ctx.closePath();
+            }
+            ctx.rect(canvas.width, 0, -canvas.width, canvas.height);
+            
+            if (player.torchOn) {
+                const ambientRadius = TILE_SIZE * 5; 
+                const darknessGradient = ctx.createRadialGradient(player.x, player.y, ambientRadius * 0.5, player.x, player.y, ambientRadius);
+                darknessGradient.addColorStop(0, 'rgba(0,0,0,0.88)'); 
+                darknessGradient.addColorStop(1, 'rgba(0,0,0,1)');   
+                ctx.fillStyle = darknessGradient;
+            } else {
+                ctx.fillStyle = 'rgba(0,0,0,1)';
+            }
+            ctx.fill('evenodd');
+            ctx.restore();
+            
+            if (echo.active) {
+                ctx.strokeStyle = `rgba(255, 255, 255, ${1 - echo.radius / echo.maxRadius})`;
+                ctx.lineWidth = 15;
+                ctx.beginPath();
+                ctx.arc(echo.x, echo.y, echo.radius, 0, Math.PI * 2);
+                ctx.stroke();
+            }
+            ctx.restore();
+        }
+        
+        function gameLoop() {
+            movePlayer();
+            updateShout();
+            updateEchoLocation();
+            updateDoors();
+            updateBats();
+            updateScreenShake();
+            draw();
+            requestAnimationFrame(gameLoop);
+        }
+
+        setup();
+    </script>
+</body>
+</html>
+
